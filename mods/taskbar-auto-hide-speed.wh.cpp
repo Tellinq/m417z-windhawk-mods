@@ -1,8 +1,8 @@
 // ==WindhawkMod==
-// @id              taskbar-left-click-cycle
-// @name            Cycle through taskbar windows on click
-// @description     Makes clicking on combined taskbar items cycle through windows instead of opening thumbnail previews
-// @version         1.1.3
+// @id              taskbar-auto-hide-speed
+// @name            Taskbar auto-hide speed
+// @description     Customize the taskbar auto-hide speed and frame rate to make it feel less sluggish and janky
+// @version         1.0
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -22,27 +22,27 @@
 
 // ==WindhawkModReadme==
 /*
-# Cycle through taskbar windows on click
+# Taskbar auto-hide speed
 
-Makes clicking on combined taskbar items cycle through windows instead of
-opening thumbnail previews. It's still possible to open thumbnail previews by
-holding the Ctrl key while clicking.
+Customize the taskbar auto-hide speed and frame rate to make it feel less
+sluggish and janky.
 
-In addition, makes Win+# hotkeys (Win+1, Win+2, etc.) cycle through taskbar
-windows.
-
-Only Windows 10 64-bit and Windows 11 are supported. For older Windows versions
-check out [7+ Taskbar Tweaker](https://tweaker.ramensoftware.com/).
-
-**Note:** To customize the old taskbar on Windows 11 (if using ExplorerPatcher
-or a similar tool), enable the relevant option in the mod's settings.
-
-![Demonstration](https://i.imgur.com/ecYYtGU.gif)
+![Demonstration](https://i.imgur.com/x7pg5xX.gif)
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
+- showSpeedup: 250
+  $name: Show animation speedup
+  $description: In percentage of the original speed
+- hideSpeedup: 250
+  $name: Hide animation speedup
+  $description: In percentage of the original speed
+- frameRate: 90
+  $name: Animation frame rate
+  $description: >-
+    Frames per second, higher frame rate will use more CPU
 - oldTaskbarOnWin11: false
   $name: Customize the old taskbar on Windows 11
   $description: >-
@@ -58,6 +58,9 @@ or a similar tool), enable the relevant option in the mod's settings.
 #include <atomic>
 
 struct {
+    int showSpeedup;
+    int hideSpeedup;
+    int frameRate;
     bool oldTaskbarOnWin11;
 } g_settings;
 
@@ -70,137 +73,97 @@ enum class WinVersion {
 
 WinVersion g_winVersion;
 
-std::atomic<bool> g_taskbarViewDllLoaded;
 std::atomic<bool> g_initialized;
 std::atomic<bool> g_explorerPatcherInitialized;
 
-bool g_inHandleWinNumHotKey;
+double g_recipCyclesPerSecond;
 
-using ShouldCycleWindows_t = bool(WINAPI*)();
-ShouldCycleWindows_t ShouldCycleWindows_Original;
-bool WINAPI ShouldCycleWindows_Hook() {
+std::atomic<DWORD> g_slideWindowThreadId;
+int g_slideWindowSpeedup;
+double g_slideWindowStartTime;
+double g_slideWindowLastFrameStartTime;
+
+void TimerInitialize() {
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    double cyclesPerSecond = static_cast<double>(freq.QuadPart);
+    g_recipCyclesPerSecond = 1.0 / cyclesPerSecond;
+}
+
+double TimerGetCycles() {
+    LARGE_INTEGER T1;
+    QueryPerformanceCounter(&T1);
+    return static_cast<double>(T1.QuadPart);
+}
+
+double TimerGetSeconds() {
+    return TimerGetCycles() * g_recipCyclesPerSecond;
+}
+
+using TrayUI_SlideWindow_t = void(WINAPI*)(void* pThis,
+                                           HWND hWnd,
+                                           const RECT* rect,
+                                           HMONITOR monitor,
+                                           bool show,
+                                           bool animate);
+TrayUI_SlideWindow_t TrayUI_SlideWindow_Original;
+void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
+                                    HWND hWnd,
+                                    const RECT* rect,
+                                    HMONITOR monitor,
+                                    bool show,
+                                    bool animate) {
     Wh_Log(L">");
 
-    return true;
+    g_slideWindowSpeedup =
+        show ? g_settings.showSpeedup : g_settings.hideSpeedup;
+    g_slideWindowStartTime = TimerGetSeconds();
+    g_slideWindowLastFrameStartTime = g_slideWindowStartTime;
+    g_slideWindowThreadId = GetCurrentThreadId();
+
+    TrayUI_SlideWindow_Original(pThis, hWnd, rect, monitor, show, animate);
+
+    g_slideWindowThreadId = 0;
 }
 
-using CTaskBtnGroup_GetGroupType_t = int(WINAPI*)(PVOID pThis);
-CTaskBtnGroup_GetGroupType_t CTaskBtnGroup_GetGroupType_Original;
-
-using CTaskListWnd__HandleClick_t = void(WINAPI*)(PVOID pThis,
-                                                  PVOID taskBtnGroup,
-                                                  int taskItemIndex,
-                                                  int clickAction,
-                                                  int param4,
-                                                  int param5);
-CTaskListWnd__HandleClick_t CTaskListWnd__HandleClick_Original;
-void WINAPI CTaskListWnd__HandleClick_Hook(PVOID pThis,
-                                           PVOID taskBtnGroup,
-                                           int taskItemIndex,
-                                           int clickAction,
-                                           int param4,
-                                           int param5) {
-    Wh_Log(L"> %d", clickAction);
-
-    auto original = [=]() {
-        CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
-                                           clickAction, param4, param5);
-    };
-
-    // Group types:
-    // 1 - Single item or multiple uncombined items
-    // 2 - Pinned item
-    // 3 - Multiple combined items
-    int groupType = CTaskBtnGroup_GetGroupType_Original(taskBtnGroup);
-    if (groupType != 3) {
-        return original();
+using GetTickCount_t = decltype(&GetTickCount);
+GetTickCount_t GetTickCount_Original;
+DWORD WINAPI GetTickCount_Hook() {
+    if (g_slideWindowThreadId != GetCurrentThreadId()) {
+        return GetTickCount_Original();
     }
 
-    constexpr int kClick = 0;
-    constexpr int kForward = 1;
-    constexpr int kBack = 2;
-    constexpr int kCtrlClick = 4;
+    DWORD ms = (g_slideWindowLastFrameStartTime - g_slideWindowStartTime) *
+                   1000.0 * (g_slideWindowSpeedup / 100.0) +
+               0.5;
 
-    int newClickAction = clickAction;
-    if (g_inHandleWinNumHotKey) {
-        if (clickAction == kForward || clickAction == kBack) {
-            newClickAction = kCtrlClick;
-        } else if (clickAction == kCtrlClick) {
-            newClickAction = kForward;
-        }
+    Wh_Log(L"> %u", ms);
 
-        Wh_Log(L"-> %d", newClickAction);
-    } else {
-        if (clickAction == kClick) {
-            newClickAction = kCtrlClick;
-        } else if (clickAction == kCtrlClick) {
-            newClickAction = kClick;
-        }
-
-        Wh_Log(L"-> %d", newClickAction);
-    }
-
-    CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
-                                       newClickAction, param4, param5);
+    return ms;
 }
 
-using CTaskListWnd_HandleWinNumHotKey_t = HRESULT(WINAPI*)(void* pThis,
-                                                           short param1,
-                                                           WORD param2);
-CTaskListWnd_HandleWinNumHotKey_t CTaskListWnd_HandleWinNumHotKey_Original;
-HRESULT WINAPI CTaskListWnd_HandleWinNumHotKey_Hook(void* pThis,
-                                                    short param1,
-                                                    WORD param2) {
-    Wh_Log(L">");
-
-    g_inHandleWinNumHotKey = true;
-
-    HRESULT ret =
-        CTaskListWnd_HandleWinNumHotKey_Original(pThis, param1, param2);
-
-    g_inHandleWinNumHotKey = false;
-
-    return ret;
-}
-
-bool HookTaskbarViewDllSymbols(HMODULE module) {
-    // Taskbar.View.dll
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {
-            {LR"(bool __cdecl ShouldCycleWindows(void))"},
-            &ShouldCycleWindows_Original,
-            ShouldCycleWindows_Hook,
-            true,
-        },
-    };
-
-    if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
-        Wh_Log(L"HookSymbols failed");
-        return false;
+using Sleep_t = decltype(&Sleep);
+Sleep_t Sleep_Original;
+void WINAPI Sleep_Hook(DWORD dwMilliseconds) {
+    if (g_slideWindowThreadId != GetCurrentThreadId()) {
+        Sleep_Original(dwMilliseconds);
+        return;
     }
 
-    return true;
-}
+    double frameTotalTime = 1000.0 / g_settings.frameRate;
 
-HMODULE GetTaskbarViewModuleHandle() {
-    HMODULE module = GetModuleHandle(L"Taskbar.View.dll");
-    if (!module) {
-        module = GetModuleHandle(L"ExplorerExtensions.dll");
+    double frameElapsedTime =
+        (TimerGetSeconds() - g_slideWindowLastFrameStartTime) * 1000.0;
+
+    int sleepTime = frameTotalTime - frameElapsedTime + 0.5;
+
+    Wh_Log(L"> %f - %f = %d", frameTotalTime, frameElapsedTime, sleepTime);
+
+    if (sleepTime > 0) {
+        Sleep_Original(sleepTime);
     }
 
-    return module;
-}
-
-void HandleLoadedModuleIfTaskbarView(HMODULE module, LPCWSTR lpLibFileName) {
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded &&
-        GetTaskbarViewModuleHandle() == module &&
-        !g_taskbarViewDllLoaded.exchange(true)) {
-        Wh_Log(L"Loaded %s", lpLibFileName);
-
-        if (HookTaskbarViewDllSymbols(module)) {
-            Wh_ApplyHookOperations();
-        }
-    }
+    g_slideWindowLastFrameStartTime = TimerGetSeconds();
 }
 
 bool HookTaskbarSymbols() {
@@ -218,18 +181,9 @@ bool HookTaskbarSymbols() {
     // Taskbar.dll, explorer.exe
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
-            {LR"(public: virtual enum eTBGROUPTYPE __cdecl CTaskBtnGroup::GetGroupType(void))"},
-            &CTaskBtnGroup_GetGroupType_Original,
-        },
-        {
-            {LR"(protected: void __cdecl CTaskListWnd::_HandleClick(struct ITaskBtnGroup *,int,enum CTaskListWnd::eCLICKACTION,int,int))"},
-            &CTaskListWnd__HandleClick_Original,
-            CTaskListWnd__HandleClick_Hook,
-        },
-        {
-            {LR"(public: virtual long __cdecl CTaskListWnd::HandleWinNumHotKey(short,unsigned short))"},
-            &CTaskListWnd_HandleWinNumHotKey_Original,
-            CTaskListWnd_HandleWinNumHotKey_Hook,
+            {LR"(public: virtual void __cdecl TrayUI::SlideWindow(struct HWND__ *,struct tagRECT const *,struct HMONITOR__ *,bool,bool))"},
+            &TrayUI_SlideWindow_Original,
+            TrayUI_SlideWindow_Hook,
         },
     };
 
@@ -324,13 +278,8 @@ bool HookExplorerPatcherSymbols(HMODULE explorerPatcherModule) {
     }
 
     EXPLORER_PATCHER_HOOK hooks[] = {
-        {R"(?GetGroupType@CTaskBtnGroup@@UEAA?AW4eTBGROUPTYPE@@XZ)",
-         &CTaskBtnGroup_GetGroupType_Original},
-        {R"(?_HandleClick@CTaskListWnd@@IEAAXPEAUITaskBtnGroup@@HW4eCLICKACTION@1@HH@Z)",
-         &CTaskListWnd__HandleClick_Original, CTaskListWnd__HandleClick_Hook},
-        {R"(?HandleWinNumHotKey@CTaskListWnd@@UEAAJFG@Z)",
-         &CTaskListWnd_HandleWinNumHotKey_Original,
-         CTaskListWnd_HandleWinNumHotKey_Hook},
+        {R"(?SlideWindow@TrayUI@@UEAAXPEAUHWND__@@PEBUtagRECT@@PEAUHMONITOR__@@_N3@Z)",
+         &TrayUI_SlideWindow_Original, TrayUI_SlideWindow_Hook},
     };
 
     bool succeeded = true;
@@ -402,29 +351,25 @@ bool HandleLoadedExplorerPatcher() {
     return true;
 }
 
-void HandleLoadedModuleIfExplorerPatcher(HMODULE module) {
-    if (module && !((ULONG_PTR)module & 3) && !g_explorerPatcherInitialized) {
-        if (IsExplorerPatcherModule(module)) {
-            HookExplorerPatcherSymbols(module);
-        }
-    }
-}
-
 using LoadLibraryExW_t = decltype(&LoadLibraryExW);
 LoadLibraryExW_t LoadLibraryExW_Original;
 HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
                                    HANDLE hFile,
                                    DWORD dwFlags) {
     HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
-    if (module) {
-        HandleLoadedModuleIfExplorerPatcher(module);
-        HandleLoadedModuleIfTaskbarView(module, lpLibFileName);
+    if (module && !((ULONG_PTR)module & 3) && !g_explorerPatcherInitialized) {
+        if (IsExplorerPatcherModule(module)) {
+            HookExplorerPatcherSymbols(module);
+        }
     }
 
     return module;
 }
 
 void LoadSettings() {
+    g_settings.showSpeedup = Wh_GetIntSetting(L"showSpeedup");
+    g_settings.hideSpeedup = Wh_GetIntSetting(L"hideSpeedup");
+    g_settings.frameRate = Wh_GetIntSetting(L"frameRate");
     g_settings.oldTaskbarOnWin11 = Wh_GetIntSetting(L"oldTaskbarOnWin11");
 }
 
@@ -449,23 +394,8 @@ BOOL Wh_ModInit() {
         if (hasWin10Taskbar && !HookTaskbarSymbols()) {
             return FALSE;
         }
-    } else if (g_winVersion >= WinVersion::Win11) {
-        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-            g_taskbarViewDllLoaded = true;
-            if (!HookTaskbarViewDllSymbols(taskbarViewModule)) {
-                return FALSE;
-            }
-        } else {
-            Wh_Log(L"Taskbar view module not loaded yet");
-        }
-
-        if (!HookTaskbarSymbols()) {
-            return FALSE;
-        }
-    } else {
-        if (!HookTaskbarSymbols()) {
-            return FALSE;
-        }
+    } else if (!HookTaskbarSymbols()) {
+        return FALSE;
     }
 
     if (!HandleLoadedExplorerPatcher()) {
@@ -480,6 +410,18 @@ BOOL Wh_ModInit() {
                                        LoadLibraryExW_Hook,
                                        &LoadLibraryExW_Original);
 
+    auto pKernelBaseGetTickCount = (decltype(&GetTickCount))GetProcAddress(
+        kernelBaseModule, "GetTickCount");
+    WindhawkUtils::Wh_SetFunctionHookT(
+        pKernelBaseGetTickCount, GetTickCount_Hook, &GetTickCount_Original);
+
+    auto pKernelBaseSleep =
+        (decltype(&Sleep))GetProcAddress(kernelBaseModule, "Sleep");
+    WindhawkUtils::Wh_SetFunctionHookT(pKernelBaseSleep, Sleep_Hook,
+                                       &Sleep_Original);
+
+    TimerInitialize();
+
     g_initialized = true;
 
     return TRUE;
@@ -487,18 +429,6 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
-
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded) {
-        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-            if (!g_taskbarViewDllLoaded.exchange(true)) {
-                Wh_Log(L"Got Taskbar.View.dll");
-
-                if (HookTaskbarViewDllSymbols(taskbarViewModule)) {
-                    Wh_ApplyHookOperations();
-                }
-            }
-        }
-    }
 
     // Try again in case there's a race between the previous attempt and the
     // LoadLibraryExW hook.

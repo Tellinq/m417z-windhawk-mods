@@ -1,8 +1,8 @@
 // ==WindhawkMod==
-// @id              taskbar-left-click-cycle
-// @name            Cycle through taskbar windows on click
-// @description     Makes clicking on combined taskbar items cycle through windows instead of opening thumbnail previews
-// @version         1.1.3
+// @id              taskbar-auto-hide-keyboard-only
+// @name            Taskbar keyboard-only auto-hide
+// @description     When taskbar auto-hide is enabled, the taskbar will only be unhidden with the keyboard, hovering the mouse over the taskbar will not unhide it
+// @version         1.1.1
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -22,27 +22,26 @@
 
 // ==WindhawkModReadme==
 /*
-# Cycle through taskbar windows on click
+# Taskbar keyboard-only auto-hide
 
-Makes clicking on combined taskbar items cycle through windows instead of
-opening thumbnail previews. It's still possible to open thumbnail previews by
-holding the Ctrl key while clicking.
-
-In addition, makes Win+# hotkeys (Win+1, Win+2, etc.) cycle through taskbar
-windows.
-
-Only Windows 10 64-bit and Windows 11 are supported. For older Windows versions
-check out [7+ Taskbar Tweaker](https://tweaker.ramensoftware.com/).
+When taskbar auto-hide is enabled, the taskbar will only be unhidden with the
+keyboard, hovering the mouse over the taskbar will not unhide it. For example,
+the Win key or Ctrl+Esc will unhide the taskbar.
 
 **Note:** To customize the old taskbar on Windows 11 (if using ExplorerPatcher
 or a similar tool), enable the relevant option in the mod's settings.
-
-![Demonstration](https://i.imgur.com/ecYYtGU.gif)
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
+- fullyHide: false
+  $name: Fully hide
+  $description: >-
+    Normally, the taskbar is hidden to a thin line which can be clicked to
+    unhide it. This option makes it so that the taskbar is fully hidden on
+    auto-hide, leaving no traces at all. With this option, the taskbar can only
+    be unhidden via the keyboard.
 - oldTaskbarOnWin11: false
   $name: Customize the old taskbar on Windows 11
   $description: >-
@@ -56,8 +55,10 @@ or a similar tool), enable the relevant option in the mod's settings.
 #include <psapi.h>
 
 #include <atomic>
+#include <vector>
 
 struct {
+    bool fullyHide;
     bool oldTaskbarOnWin11;
 } g_settings;
 
@@ -70,136 +71,153 @@ enum class WinVersion {
 
 WinVersion g_winVersion;
 
-std::atomic<bool> g_taskbarViewDllLoaded;
 std::atomic<bool> g_initialized;
 std::atomic<bool> g_explorerPatcherInitialized;
 
-bool g_inHandleWinNumHotKey;
+enum {
+    kTrayUITimerHide = 2,
+    kTrayUITimerUnhide = 3,
+};
 
-using ShouldCycleWindows_t = bool(WINAPI*)();
-ShouldCycleWindows_t ShouldCycleWindows_Original;
-bool WINAPI ShouldCycleWindows_Hook() {
-    Wh_Log(L">");
+bool IsTaskbarWindow(HWND hWnd) {
+    WCHAR szClassName[32];
+    if (!GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName))) {
+        return false;
+    }
 
-    return true;
+    return _wcsicmp(szClassName, L"Shell_TrayWnd") == 0 ||
+           _wcsicmp(szClassName, L"Shell_SecondaryTrayWnd") == 0;
 }
 
-using CTaskBtnGroup_GetGroupType_t = int(WINAPI*)(PVOID pThis);
-CTaskBtnGroup_GetGroupType_t CTaskBtnGroup_GetGroupType_Original;
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND hTaskbarWnd = nullptr;
 
-using CTaskListWnd__HandleClick_t = void(WINAPI*)(PVOID pThis,
-                                                  PVOID taskBtnGroup,
-                                                  int taskItemIndex,
-                                                  int clickAction,
-                                                  int param4,
-                                                  int param5);
-CTaskListWnd__HandleClick_t CTaskListWnd__HandleClick_Original;
-void WINAPI CTaskListWnd__HandleClick_Hook(PVOID pThis,
-                                           PVOID taskBtnGroup,
-                                           int taskItemIndex,
-                                           int clickAction,
-                                           int param4,
-                                           int param5) {
-    Wh_Log(L"> %d", clickAction);
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            DWORD dwProcessId;
+            WCHAR className[32];
+            if (GetWindowThreadProcessId(hWnd, &dwProcessId) &&
+                dwProcessId == GetCurrentProcessId() &&
+                GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hWnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&hTaskbarWnd));
 
-    auto original = [=]() {
-        CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
-                                           clickAction, param4, param5);
+    return hTaskbarWnd;
+}
+
+HWND FindTaskbarWindows(std::vector<HWND>* secondaryTaskbarWindows) {
+    secondaryTaskbarWindows->clear();
+
+    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
+    if (!hTaskbarWnd) {
+        return nullptr;
+    }
+
+    DWORD taskbarThreadId = GetWindowThreadProcessId(hTaskbarWnd, nullptr);
+    if (!taskbarThreadId) {
+        return nullptr;
+    }
+
+    auto enumWindowsProc = [&secondaryTaskbarWindows](HWND hWnd) -> BOOL {
+        WCHAR szClassName[32];
+        if (GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) == 0) {
+            return TRUE;
+        }
+
+        if (_wcsicmp(szClassName, L"Shell_SecondaryTrayWnd") == 0) {
+            secondaryTaskbarWindows->push_back(hWnd);
+        }
+
+        return TRUE;
     };
 
-    // Group types:
-    // 1 - Single item or multiple uncombined items
-    // 2 - Pinned item
-    // 3 - Multiple combined items
-    int groupType = CTaskBtnGroup_GetGroupType_Original(taskBtnGroup);
-    if (groupType != 3) {
-        return original();
-    }
+    EnumThreadWindows(
+        taskbarThreadId,
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            auto& proc = *reinterpret_cast<decltype(enumWindowsProc)*>(lParam);
+            return proc(hWnd);
+        },
+        reinterpret_cast<LPARAM>(&enumWindowsProc));
 
-    constexpr int kClick = 0;
-    constexpr int kForward = 1;
-    constexpr int kBack = 2;
-    constexpr int kCtrlClick = 4;
-
-    int newClickAction = clickAction;
-    if (g_inHandleWinNumHotKey) {
-        if (clickAction == kForward || clickAction == kBack) {
-            newClickAction = kCtrlClick;
-        } else if (clickAction == kCtrlClick) {
-            newClickAction = kForward;
-        }
-
-        Wh_Log(L"-> %d", newClickAction);
-    } else {
-        if (clickAction == kClick) {
-            newClickAction = kCtrlClick;
-        } else if (clickAction == kCtrlClick) {
-            newClickAction = kClick;
-        }
-
-        Wh_Log(L"-> %d", newClickAction);
-    }
-
-    CTaskListWnd__HandleClick_Original(pThis, taskBtnGroup, taskItemIndex,
-                                       newClickAction, param4, param5);
+    return hTaskbarWnd;
 }
 
-using CTaskListWnd_HandleWinNumHotKey_t = HRESULT(WINAPI*)(void* pThis,
-                                                           short param1,
-                                                           WORD param2);
-CTaskListWnd_HandleWinNumHotKey_t CTaskListWnd_HandleWinNumHotKey_Original;
-HRESULT WINAPI CTaskListWnd_HandleWinNumHotKey_Hook(void* pThis,
-                                                    short param1,
-                                                    WORD param2) {
-    Wh_Log(L">");
+using ShowWindow_t = decltype(&ShowWindow);
+ShowWindow_t ShowWindow_Original;
+BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
+    if (g_settings.fullyHide && IsTaskbarWindow(hWnd)) {
+        Wh_Log(L">");
+        return TRUE;
+    }
 
-    g_inHandleWinNumHotKey = true;
-
-    HRESULT ret =
-        CTaskListWnd_HandleWinNumHotKey_Original(pThis, param1, param2);
-
-    g_inHandleWinNumHotKey = false;
+    BOOL ret = ShowWindow_Original(hWnd, nCmdShow);
 
     return ret;
 }
 
-bool HookTaskbarViewDllSymbols(HMODULE module) {
-    // Taskbar.View.dll
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {
-            {LR"(bool __cdecl ShouldCycleWindows(void))"},
-            &ShouldCycleWindows_Original,
-            ShouldCycleWindows_Hook,
-            true,
-        },
-    };
+using IsWindowVisible_t = decltype(&IsWindowVisible);
+IsWindowVisible_t IsWindowVisible_Original;
+BOOL WINAPI IsWindowVisible_Hook(HWND hWnd) {
+    BOOL ret = IsWindowVisible_Original(hWnd);
 
-    if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
-        Wh_Log(L"HookSymbols failed");
-        return false;
-    }
-
-    return true;
-}
-
-HMODULE GetTaskbarViewModuleHandle() {
-    HMODULE module = GetModuleHandle(L"Taskbar.View.dll");
-    if (!module) {
-        module = GetModuleHandle(L"ExplorerExtensions.dll");
-    }
-
-    return module;
-}
-
-void HandleLoadedModuleIfTaskbarView(HMODULE module, LPCWSTR lpLibFileName) {
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded &&
-        GetTaskbarViewModuleHandle() == module &&
-        !g_taskbarViewDllLoaded.exchange(true)) {
-        Wh_Log(L"Loaded %s", lpLibFileName);
-
-        if (HookTaskbarViewDllSymbols(module)) {
-            Wh_ApplyHookOperations();
+    // Checked in CTaskListWnd::HandleWinNumHotKey, Win+num hotkeys don't work
+    // if the window is hidden. Return TRUE to make the hotkeys work.
+    if (!ret && g_settings.fullyHide) {
+        WCHAR szClassName[32];
+        if (GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) &&
+            _wcsicmp(szClassName, L"MSTaskSwWClass") == 0) {
+            Wh_Log(L">");
+            return TRUE;
         }
+    }
+
+    return ret;
+}
+
+using SetTimer_t = decltype(&SetTimer);
+SetTimer_t SetTimer_Original;
+UINT_PTR WINAPI SetTimer_Hook(HWND hWnd,
+                              UINT_PTR nIDEvent,
+                              UINT uElapse,
+                              TIMERPROC lpTimerFunc) {
+    if (nIDEvent == kTrayUITimerUnhide && IsTaskbarWindow(hWnd)) {
+        Wh_Log(L">");
+        return 1;
+    }
+
+    UINT_PTR ret = SetTimer_Original(hWnd, nIDEvent, uElapse, lpTimerFunc);
+
+    return ret;
+}
+
+using TrayUI_SlideWindow_t = void(WINAPI*)(void* pThis,
+                                           HWND hWnd,
+                                           const RECT* rc,
+                                           HMONITOR monitor,
+                                           bool show,
+                                           bool flag);
+TrayUI_SlideWindow_t TrayUI_SlideWindow_Original;
+void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
+                                    HWND hWnd,
+                                    const RECT* rc,
+                                    HMONITOR monitor,
+                                    bool show,
+                                    bool flag) {
+    Wh_Log(L">");
+
+    if (show && g_settings.fullyHide) {
+        ShowWindow_Original(hWnd, SW_SHOWNA);
+    }
+
+    TrayUI_SlideWindow_Original(pThis, hWnd, rc, monitor, show, flag);
+
+    if (!show && g_settings.fullyHide) {
+        ShowWindow_Original(hWnd, SW_HIDE);
     }
 }
 
@@ -218,18 +236,9 @@ bool HookTaskbarSymbols() {
     // Taskbar.dll, explorer.exe
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
-            {LR"(public: virtual enum eTBGROUPTYPE __cdecl CTaskBtnGroup::GetGroupType(void))"},
-            &CTaskBtnGroup_GetGroupType_Original,
-        },
-        {
-            {LR"(protected: void __cdecl CTaskListWnd::_HandleClick(struct ITaskBtnGroup *,int,enum CTaskListWnd::eCLICKACTION,int,int))"},
-            &CTaskListWnd__HandleClick_Original,
-            CTaskListWnd__HandleClick_Hook,
-        },
-        {
-            {LR"(public: virtual long __cdecl CTaskListWnd::HandleWinNumHotKey(short,unsigned short))"},
-            &CTaskListWnd_HandleWinNumHotKey_Original,
-            CTaskListWnd_HandleWinNumHotKey_Hook,
+            {LR"(public: virtual void __cdecl TrayUI::SlideWindow(struct HWND__ *,struct tagRECT const *,struct HMONITOR__ *,bool,bool))"},
+            &TrayUI_SlideWindow_Original,
+            TrayUI_SlideWindow_Hook,
         },
     };
 
@@ -324,13 +333,8 @@ bool HookExplorerPatcherSymbols(HMODULE explorerPatcherModule) {
     }
 
     EXPLORER_PATCHER_HOOK hooks[] = {
-        {R"(?GetGroupType@CTaskBtnGroup@@UEAA?AW4eTBGROUPTYPE@@XZ)",
-         &CTaskBtnGroup_GetGroupType_Original},
-        {R"(?_HandleClick@CTaskListWnd@@IEAAXPEAUITaskBtnGroup@@HW4eCLICKACTION@1@HH@Z)",
-         &CTaskListWnd__HandleClick_Original, CTaskListWnd__HandleClick_Hook},
-        {R"(?HandleWinNumHotKey@CTaskListWnd@@UEAAJFG@Z)",
-         &CTaskListWnd_HandleWinNumHotKey_Original,
-         CTaskListWnd_HandleWinNumHotKey_Hook},
+        {R"(?SlideWindow@TrayUI@@UEAAXPEAUHWND__@@PEBUtagRECT@@PEAUHMONITOR__@@_N3@Z)",
+         &TrayUI_SlideWindow_Original, TrayUI_SlideWindow_Hook},
     };
 
     bool succeeded = true;
@@ -402,29 +406,23 @@ bool HandleLoadedExplorerPatcher() {
     return true;
 }
 
-void HandleLoadedModuleIfExplorerPatcher(HMODULE module) {
-    if (module && !((ULONG_PTR)module & 3) && !g_explorerPatcherInitialized) {
-        if (IsExplorerPatcherModule(module)) {
-            HookExplorerPatcherSymbols(module);
-        }
-    }
-}
-
 using LoadLibraryExW_t = decltype(&LoadLibraryExW);
 LoadLibraryExW_t LoadLibraryExW_Original;
 HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
                                    HANDLE hFile,
                                    DWORD dwFlags) {
     HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
-    if (module) {
-        HandleLoadedModuleIfExplorerPatcher(module);
-        HandleLoadedModuleIfTaskbarView(module, lpLibFileName);
+    if (module && !((ULONG_PTR)module & 3) && !g_explorerPatcherInitialized) {
+        if (IsExplorerPatcherModule(module)) {
+            HookExplorerPatcherSymbols(module);
+        }
     }
 
     return module;
 }
 
 void LoadSettings() {
+    g_settings.fullyHide = Wh_GetIntSetting(L"fullyHide");
     g_settings.oldTaskbarOnWin11 = Wh_GetIntSetting(L"oldTaskbarOnWin11");
 }
 
@@ -449,23 +447,8 @@ BOOL Wh_ModInit() {
         if (hasWin10Taskbar && !HookTaskbarSymbols()) {
             return FALSE;
         }
-    } else if (g_winVersion >= WinVersion::Win11) {
-        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-            g_taskbarViewDllLoaded = true;
-            if (!HookTaskbarViewDllSymbols(taskbarViewModule)) {
-                return FALSE;
-            }
-        } else {
-            Wh_Log(L"Taskbar view module not loaded yet");
-        }
-
-        if (!HookTaskbarSymbols()) {
-            return FALSE;
-        }
-    } else {
-        if (!HookTaskbarSymbols()) {
-            return FALSE;
-        }
+    } else if (!HookTaskbarSymbols()) {
+        return FALSE;
     }
 
     if (!HandleLoadedExplorerPatcher()) {
@@ -480,43 +463,66 @@ BOOL Wh_ModInit() {
                                        LoadLibraryExW_Hook,
                                        &LoadLibraryExW_Original);
 
+    WindhawkUtils::Wh_SetFunctionHookT(ShowWindow, ShowWindow_Hook,
+                                       &ShowWindow_Original);
+
+    WindhawkUtils::Wh_SetFunctionHookT(IsWindowVisible, IsWindowVisible_Hook,
+                                       &IsWindowVisible_Original);
+
+    WindhawkUtils::Wh_SetFunctionHookT(SetTimer, SetTimer_Hook,
+                                       &SetTimer_Original);
+
     g_initialized = true;
 
     return TRUE;
 }
 
+void ShowAllTaskbars(int nCmdShow) {
+    std::vector<HWND> secondaryTaskbarWindows;
+    HWND taskbarWindow = FindTaskbarWindows(&secondaryTaskbarWindows);
+    ShowWindow_Original(taskbarWindow, nCmdShow);
+    for (HWND hWnd : secondaryTaskbarWindows) {
+        ShowWindow_Original(hWnd, nCmdShow);
+    }
+}
+
 void Wh_ModAfterInit() {
     Wh_Log(L">");
-
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded) {
-        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-            if (!g_taskbarViewDllLoaded.exchange(true)) {
-                Wh_Log(L"Got Taskbar.View.dll");
-
-                if (HookTaskbarViewDllSymbols(taskbarViewModule)) {
-                    Wh_ApplyHookOperations();
-                }
-            }
-        }
-    }
 
     // Try again in case there's a race between the previous attempt and the
     // LoadLibraryExW hook.
     if (!g_explorerPatcherInitialized) {
         HandleLoadedExplorerPatcher();
     }
+
+    if (g_settings.fullyHide) {
+        ShowAllTaskbars(SW_HIDE);
+    }
 }
 
 void Wh_ModUninit() {
     Wh_Log(L">");
+
+    if (g_settings.fullyHide) {
+        ShowAllTaskbars(SW_SHOWNA);
+    }
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     Wh_Log(L">");
 
     bool prevOldTaskbarOnWin11 = g_settings.oldTaskbarOnWin11;
+    bool prevFullyHide = g_settings.fullyHide;
 
     LoadSettings();
+
+    if (g_settings.fullyHide != prevFullyHide) {
+        if (g_settings.fullyHide) {
+            ShowAllTaskbars(SW_HIDE);
+        } else {
+            ShowAllTaskbars(SW_SHOWNA);
+        }
+    }
 
     *bReload = g_settings.oldTaskbarOnWin11 != prevOldTaskbarOnWin11;
 

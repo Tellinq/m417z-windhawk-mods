@@ -102,6 +102,11 @@ code from the **TranslucentTB** project.
     - value: ""
       $name: Value
   $name: Resource variables
+- explorerFrameContainerHeight: 0
+  $name: Explorer frame container height
+  $description: >-
+    The height of the explorer frame container which includes the tabs, the
+    address bar, and the command bar, set to zero to use the default height
 */
 // ==/WindhawkModSettings==
 
@@ -112,6 +117,12 @@ code from the **TranslucentTB** project.
 #undef GetCurrentTime
 
 #include <winrt/Microsoft.UI.Xaml.h>
+
+struct {
+    int explorerFrameContainerHeight;
+} g_settings;
+
+bool g_windowsUIFileExplorerSymbolsHooked;
 
 std::atomic<bool> g_initialized;
 thread_local bool g_initializedForThread;
@@ -483,6 +494,8 @@ HRESULT InjectWindhawkTAP() noexcept
 // clang-format on
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <windhawk_utils.h>
+
 #include <list>
 #include <optional>
 #include <sstream>
@@ -622,13 +635,12 @@ void SetOrClearValue(DependencyObject elementDo,
     // This might fail. See `ReadLocalValueWithWorkaround` for an example (which
     // we now handle but there might be other cases).
     try {
-        // TODO: Is this still needed?
-#if 0
         // `setter.Value()` returns font weight as an int. Using it with
         // `SetValue` results in the following error: 0x80004002 (No such
         // interface supported). Box it as `Windows.UI.Text.FontWeight` as a
         // workaround.
-        if (property == Controls::TextBlock::FontWeightProperty()) {
+        if (property == Controls::TextBlock::FontWeightProperty() ||
+            property == Controls::Control::FontWeightProperty()) {
             auto valueInt = value.try_as<int>();
             if (valueInt && *valueInt >= std::numeric_limits<uint16_t>::min() &&
                 *valueInt <= std::numeric_limits<uint16_t>::max()) {
@@ -636,7 +648,6 @@ void SetOrClearValue(DependencyObject elementDo,
                     static_cast<uint16_t>(*valueInt)});
             }
         }
-#endif
 
         elementDo.SetValue(property, value);
     } catch (winrt::hresult_error const& ex) {
@@ -1362,10 +1373,6 @@ StyleRule StyleRuleFromString(std::wstring_view str) {
     auto atPos = name.find(L'@');
     if (atPos != name.npos) {
         result.visualState = TrimStringView(name.substr(atPos + 1));
-        if (result.visualState.empty()) {
-            throw std::runtime_error("Bad style syntax, empty visual state");
-        }
-
         name = name.substr(0, atPos);
     }
 
@@ -1597,10 +1604,19 @@ void InitializeSettingsAndTap() {
     }
 }
 
-void OnWindowCreated(HWND hWnd, LPCWSTR lpClassName, PCSTR funcName) {
-    bool textualClassName = ((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0;
-    if (textualClassName && _wcsicmp(lpClassName, L"CabinetWClass") == 0) {
-        Wh_Log(L"Initializing - Created CabinetWClass: %08X via %S",
+bool IsTargetWindow(HWND hWnd) {
+    WCHAR className[64];
+    if (!GetClassName(hWnd, className, ARRAYSIZE(className))) {
+        return false;
+    }
+
+    return _wcsicmp(className, L"CabinetWClass") == 0 ||
+           _wcsicmp(className, L"XamlExplorerHostIslandWindow_WASDK") == 0;
+}
+
+void OnWindowCreated(HWND hWnd, PCSTR funcName) {
+    if (IsTargetWindow(hWnd)) {
+        Wh_Log(L"Initializing - Created window %08X via %S",
                (DWORD)(ULONG_PTR)hWnd, funcName);
         InitializeForCurrentThread();
         InitializeSettingsAndTap();
@@ -1628,7 +1644,87 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
         return hWnd;
     }
 
-    OnWindowCreated(hWnd, lpClassName, __FUNCTION__);
+    OnWindowCreated(hWnd, __FUNCTION__);
+
+    return hWnd;
+}
+
+using CreateWindowInBand_t = HWND(WINAPI*)(DWORD dwExStyle,
+                                           LPCWSTR lpClassName,
+                                           LPCWSTR lpWindowName,
+                                           DWORD dwStyle,
+                                           int X,
+                                           int Y,
+                                           int nWidth,
+                                           int nHeight,
+                                           HWND hWndParent,
+                                           HMENU hMenu,
+                                           HINSTANCE hInstance,
+                                           PVOID lpParam,
+                                           DWORD dwBand);
+CreateWindowInBand_t CreateWindowInBand_Original;
+HWND WINAPI CreateWindowInBand_Hook(DWORD dwExStyle,
+                                    LPCWSTR lpClassName,
+                                    LPCWSTR lpWindowName,
+                                    DWORD dwStyle,
+                                    int X,
+                                    int Y,
+                                    int nWidth,
+                                    int nHeight,
+                                    HWND hWndParent,
+                                    HMENU hMenu,
+                                    HINSTANCE hInstance,
+                                    PVOID lpParam,
+                                    DWORD dwBand) {
+    HWND hWnd = CreateWindowInBand_Original(
+        dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
+        hWndParent, hMenu, hInstance, lpParam, dwBand);
+    if (!hWnd) {
+        return hWnd;
+    }
+
+    OnWindowCreated(hWnd, __FUNCTION__);
+
+    return hWnd;
+}
+
+using CreateWindowInBandEx_t = HWND(WINAPI*)(DWORD dwExStyle,
+                                             LPCWSTR lpClassName,
+                                             LPCWSTR lpWindowName,
+                                             DWORD dwStyle,
+                                             int X,
+                                             int Y,
+                                             int nWidth,
+                                             int nHeight,
+                                             HWND hWndParent,
+                                             HMENU hMenu,
+                                             HINSTANCE hInstance,
+                                             PVOID lpParam,
+                                             DWORD dwBand,
+                                             DWORD dwTypeFlags);
+CreateWindowInBandEx_t CreateWindowInBandEx_Original;
+HWND WINAPI CreateWindowInBandEx_Hook(DWORD dwExStyle,
+                                      LPCWSTR lpClassName,
+                                      LPCWSTR lpWindowName,
+                                      DWORD dwStyle,
+                                      int X,
+                                      int Y,
+                                      int nWidth,
+                                      int nHeight,
+                                      HWND hWndParent,
+                                      HMENU hMenu,
+                                      HINSTANCE hInstance,
+                                      PVOID lpParam,
+                                      DWORD dwBand,
+                                      DWORD dwTypeFlags) {
+    HWND hWnd = CreateWindowInBandEx_Original(
+        dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
+        hWndParent, hMenu, hInstance, lpParam, dwBand, dwTypeFlags);
+    if (!hWnd) {
+        return hWnd;
+    }
+
+    OnWindowCreated(hWnd, __FUNCTION__);
 
     return hWnd;
 }
@@ -1658,7 +1754,7 @@ bool RunFromWindowThread(HWND hWnd,
 
     HHOOK hook = SetWindowsHookEx(
         WH_CALLWNDPROC,
-        [](int nCode, WPARAM wParam, LPARAM lParam) WINAPI -> LRESULT {
+        [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
             if (nCode == HC_ACTION) {
                 const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
                 if (cwp->message == runFromWindowThreadRegisteredMsg) {
@@ -1685,7 +1781,7 @@ bool RunFromWindowThread(HWND hWnd,
     return true;
 }
 
-std::vector<HWND> GetExplorerWnds() {
+std::vector<HWND> GetTargetWnds() {
     struct ENUM_WINDOWS_PARAM {
         std::vector<HWND>* hWnds;
     };
@@ -1693,7 +1789,7 @@ std::vector<HWND> GetExplorerWnds() {
     std::vector<HWND> hWnds;
     ENUM_WINDOWS_PARAM param = {&hWnds};
     EnumWindows(
-        [](HWND hWnd, LPARAM lParam) WINAPI -> BOOL {
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
             ENUM_WINDOWS_PARAM& param = *(ENUM_WINDOWS_PARAM*)lParam;
 
             DWORD dwProcessId = 0;
@@ -1702,12 +1798,7 @@ std::vector<HWND> GetExplorerWnds() {
                 return TRUE;
             }
 
-            WCHAR szClassName[32];
-            if (GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) == 0) {
-                return TRUE;
-            }
-
-            if (_wcsicmp(szClassName, L"CabinetWClass") == 0) {
+            if (IsTargetWindow(hWnd)) {
                 param.hWnds->push_back(hWnd);
             }
 
@@ -1718,11 +1809,89 @@ std::vector<HWND> GetExplorerWnds() {
     return hWnds;
 }
 
+using XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t =
+    HRESULT(WINAPI*)(void* pThis, SIZE* size);
+XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t
+    XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original;
+HRESULT WINAPI
+XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook(void* pThis,
+                                                           SIZE* size) {
+    Wh_Log(L">");
+
+    HRESULT ret =
+        XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original(pThis,
+                                                                       size);
+
+    if (SUCCEEDED(ret) && g_settings.explorerFrameContainerHeight) {
+        int originalCy = size->cy;
+        size->cy =
+            MulDiv(size->cy, g_settings.explorerFrameContainerHeight, 136);
+        Wh_Log(L"%d -> %d", originalCy, size->cy);
+    }
+
+    return ret;
+}
+
+bool HookWindowsUIFileExplorerSymbols() {
+    HMODULE module = LoadLibrary(L"Windows.UI.FileExplorer.dll");
+    if (!module) {
+        Wh_Log(L"Couldn't load Windows.UI.FileExplorer.dll");
+        return false;
+    }
+
+    // Windows.UI.FileExplorer.dll
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {LR"(public: virtual long __cdecl XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels(struct tagSIZE *))"},
+            &XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original,
+            XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook,
+        },
+    };
+
+    if (!HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    return true;
+}
+
+void LoadSettings() {
+    g_settings.explorerFrameContainerHeight =
+        Wh_GetIntSetting(L"explorerFrameContainerHeight");
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
+    LoadSettings();
+
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook,
                        (void**)&CreateWindowExW_Original);
+
+    HMODULE user32Module = LoadLibrary(L"user32.dll");
+    if (user32Module) {
+        void* pCreateWindowInBand =
+            (void*)GetProcAddress(user32Module, "CreateWindowInBand");
+        if (pCreateWindowInBand) {
+            Wh_SetFunctionHook(pCreateWindowInBand,
+                               (void*)CreateWindowInBand_Hook,
+                               (void**)&CreateWindowInBand_Original);
+        }
+
+        void* pCreateWindowInBandEx =
+            (void*)GetProcAddress(user32Module, "CreateWindowInBandEx");
+        if (pCreateWindowInBandEx) {
+            Wh_SetFunctionHook(pCreateWindowInBandEx,
+                               (void*)CreateWindowInBandEx_Hook,
+                               (void**)&CreateWindowInBandEx_Original);
+        }
+    }
+
+    if (g_settings.explorerFrameContainerHeight &&
+        HookWindowsUIFileExplorerSymbols()) {
+        g_windowsUIFileExplorerSymbolsHooked = true;
+    }
 
     return TRUE;
 }
@@ -1730,16 +1899,15 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    auto hExplorerWnds = GetExplorerWnds();
-    for (auto hExplorerWnd : hExplorerWnds) {
-        Wh_Log(L"Initializing for %08X", (DWORD)(ULONG_PTR)hExplorerWnd);
+    auto hTargetWnds = GetTargetWnds();
+    for (auto hTargetWnd : hTargetWnds) {
+        Wh_Log(L"Initializing for %08X", (DWORD)(ULONG_PTR)hTargetWnd);
         RunFromWindowThread(
-            hExplorerWnd, [](PVOID) WINAPI { InitializeForCurrentThread(); },
-            nullptr);
+            hTargetWnd, [](PVOID) { InitializeForCurrentThread(); }, nullptr);
     }
 
-    if (hExplorerWnds.size() > 0) {
-        Wh_Log(L"Initializing - Found explorer windows");
+    if (hTargetWnds.size() > 0) {
+        Wh_Log(L"Initializing - Found target windows");
         InitializeSettingsAndTap();
     }
 }
@@ -1749,12 +1917,11 @@ void Wh_ModUninit() {
 
     UninitializeSettingsAndTap();
 
-    auto hExplorerWnds = GetExplorerWnds();
-    for (auto hExplorerWnd : hExplorerWnds) {
-        Wh_Log(L"Uninitializing for %08X", (DWORD)(ULONG_PTR)hExplorerWnd);
+    auto hTargetWnds = GetTargetWnds();
+    for (auto hTargetWnd : hTargetWnds) {
+        Wh_Log(L"Uninitializing for %08X", (DWORD)(ULONG_PTR)hTargetWnd);
         RunFromWindowThread(
-            hExplorerWnd, [](PVOID) WINAPI { UninitializeForCurrentThread(); },
-            nullptr);
+            hTargetWnd, [](PVOID) { UninitializeForCurrentThread(); }, nullptr);
     }
 }
 
@@ -1763,20 +1930,29 @@ void Wh_ModSettingsChanged() {
 
     UninitializeSettingsAndTap();
 
-    auto hExplorerWnds = GetExplorerWnds();
-    for (auto hExplorerWnd : hExplorerWnds) {
-        Wh_Log(L"Reinitializing for %08X", (DWORD)(ULONG_PTR)hExplorerWnd);
+    auto hTargetWnds = GetTargetWnds();
+    for (auto hTargetWnd : hTargetWnds) {
+        Wh_Log(L"Reinitializing for %08X", (DWORD)(ULONG_PTR)hTargetWnd);
         RunFromWindowThread(
-            hExplorerWnd,
-            [](PVOID) WINAPI {
+            hTargetWnd,
+            [](PVOID) {
                 UninitializeForCurrentThread();
                 InitializeForCurrentThread();
             },
             nullptr);
     }
 
-    if (hExplorerWnds.size() > 0) {
-        Wh_Log(L"Reinitializing - Found explorer windows");
+    if (hTargetWnds.size() > 0) {
+        Wh_Log(L"Reinitializing - Found target windows");
         InitializeSettingsAndTap();
+    }
+
+    LoadSettings();
+
+    if (!g_windowsUIFileExplorerSymbolsHooked &&
+        g_settings.explorerFrameContainerHeight &&
+        HookWindowsUIFileExplorerSymbols()) {
+        Wh_ApplyHookOperations();
+        g_windowsUIFileExplorerSymbolsHooked = true;
     }
 }
