@@ -92,13 +92,17 @@ Labels can also be shown or hidden per-program in the settings.
   $options:
   - centerFixed: Centered, fixed size
   - centerDynamic: Centered, dynamic size
-  - left: On the left (below the icon)
+  - left: On the left (below the icon), fixed size
+  - leftIconWidth: On the left (below the icon), icon width
+  - leftFocusedIconWidth: On the left (below the icon), focused icon width
+  - focusedFullWidth: Focused full width
   - fullWidth: Full width
 - progressIndicatorStyle: sameAsRunningIndicatorStyle
   $name: Progress indicator style
   $options:
   - sameAsRunningIndicatorStyle: Same as running indicator style
   - centerDynamic: Centered, dynamic size
+  - leftIconWidth: On the left (below the icon), icon width
   - fullWidth: Full width
 - excludedPrograms: [excluded1.exe]
   $name: Excluded programs
@@ -206,6 +210,9 @@ enum class IndicatorStyle {
     centerFixed,
     centerDynamic,
     left,
+    leftIconWidth,
+    leftFocusedIconWidth,
+    focusedFullWidth,
     fullWidth,
 };
 
@@ -862,6 +869,12 @@ void UpdateTaskListButtonWidth(FrameworkElement taskListButtonElement,
             if (indicatorStyle == IndicatorStyle::centerDynamic) {
                 minWidth = indicatorElement.Width() * widthToSet /
                            g_initialTaskbarItemWidth;
+            } else if (indicatorStyle == IndicatorStyle::leftIconWidth) {
+                minWidth = iconElement.ActualWidth();
+            } else if (indicatorStyle == IndicatorStyle::leftFocusedIconWidth) {
+                minWidth = iconElement.ActualWidth() - 16 + indicatorElement.Width();
+            } else if (indicatorStyle == IndicatorStyle::focusedFullWidth) {
+                minWidth = widthToSet - 22 + indicatorElement.Width();
             } else if (indicatorStyle == IndicatorStyle::fullWidth) {
                 minWidth = widthToSet - 6;
             }
@@ -883,7 +896,7 @@ void UpdateTaskListButtonWidth(FrameworkElement taskListButtonElement,
         }
 
         indicatorElement.Margin(Thickness{
-            .Right = indicatorStyle == IndicatorStyle::left && showLabels
+            .Right = (indicatorStyle == IndicatorStyle::left || indicatorStyle == IndicatorStyle::leftFocusedIconWidth) && showLabels
                          ? (widthToSet - iconElement.ActualWidth() -
                             g_settings.leftAndRightPaddingSize * 2 - 4)
                          : 0.0,
@@ -1087,7 +1100,7 @@ void UpdateTaskListButtonWithLabelStyle(
                 : (isProgressIndicator ? g_settings.progressIndicatorStyle
                                        : g_settings.runningIndicatorStyle);
 
-        if (indicatorStyle == IndicatorStyle::left) {
+        if (indicatorStyle == IndicatorStyle::left || indicatorStyle == IndicatorStyle::leftIconWidth || indicatorStyle == IndicatorStyle::leftFocusedIconWidth) {
             indicatorElement.SetValue(Controls::Grid::ColumnSpanProperty(),
                                       winrt::box_value(1));
         } else {
@@ -1109,9 +1122,15 @@ void UpdateTaskListButtonWithLabelStyle(
                 if (firstColumnWidthPixels > 0) {
                     minWidth = indicatorElementWidth * taskListButtonWidth /
                                firstColumnWidthPixels;
-                }
-            } else if (indicatorStyle == IndicatorStyle::fullWidth) {
-                minWidth = taskListButtonWidth - 6;
+            }
+        } else if (indicatorStyle == IndicatorStyle::leftIconWidth) {
+            minWidth = iconWidth;
+        } else if (indicatorStyle == IndicatorStyle::leftFocusedIconWidth) {
+            minWidth = iconWidth - 16 + indicatorElement.Width();
+        } else if (indicatorStyle == IndicatorStyle::focusedFullWidth) {
+            minWidth = taskListButtonWidth - 22 + indicatorElement.Width();
+        } else if (indicatorStyle == IndicatorStyle::fullWidth) {
+            minWidth = taskListButtonWidth - 6;
                 if (minWidth < 0) {
                     minWidth = 0;
                 }
@@ -1147,7 +1166,7 @@ void UpdateTaskListButtonWithLabelStyle(
         indicatorMargin.Right = 0;
         auto indicatorHorizontalAlignment = HorizontalAlignment::Stretch;
         if (!g_unloading && labelControlElement) {
-            if (indicatorStyle == IndicatorStyle::left) {
+            if (indicatorStyle == IndicatorStyle::left || indicatorStyle == IndicatorStyle::leftIconWidth || indicatorStyle == IndicatorStyle::leftFocusedIconWidth) {
                 indicatorMargin.Left =
                     (40 - firstColumnWidthPixels) + (iconWidth - 24) +
                     (g_settings.leftAndRightPaddingSize - 8) * 2;
@@ -1708,25 +1727,25 @@ LONG WINAPI RegGetValueW_Hook(HKEY hkey,
         DWORD taskbarGlomLevel = (ret == ERROR_SUCCESS) ? *(DWORD*)pvData : 0;
         DWORD taskbarGlomLevelOriginal = taskbarGlomLevel;
 
-        if (!g_unloading) {
-            // 0 - Always
-            // 1 - When taskbar is full
-            // 2 - Never
-            if (g_settings.mode == Mode::noLabelsWithCombining ||
-                g_settings.mode == Mode::labelsWithCombining) {
-                taskbarGlomLevel = 0;
-            } else if (taskbarGlomLevel == 0) {
-                taskbarGlomLevel = 2;
-            }
-        }
+        // if (!g_unloading) {
+        //     // 0 - Always
+        //     // 1 - When taskbar is full
+        //     // 2 - Never
+        //     if (g_settings.mode == Mode::noLabelsWithCombining ||
+        //         g_settings.mode == Mode::labelsWithCombining) {
+        //         taskbarGlomLevel = 0;
+        //     } else if (taskbarGlomLevel == 0) {
+        //         taskbarGlomLevel = 2;
+        //     }
+        // }
 
-        if (g_overrideGroupingMode) {
-            if (taskbarGlomLevel == 0) {
-                taskbarGlomLevel = 2;
-            } else {
-                taskbarGlomLevel = 0;
-            }
-        }
+        // if (g_overrideGroupingMode) {
+        //     if (taskbarGlomLevel == 0) {
+        //         taskbarGlomLevel = 2;
+        //     } else {
+        //         taskbarGlomLevel = 0;
+        //     }
+        // }
 
         Wh_Log(L"Overriding TaskbarGlomLevel: %u->%u", taskbarGlomLevelOriginal,
                taskbarGlomLevel);
@@ -1790,6 +1809,12 @@ void LoadSettings() {
         g_settings.runningIndicatorStyle = IndicatorStyle::centerDynamic;
     } else if (wcscmp(runningIndicatorStyle, L"left") == 0) {
         g_settings.runningIndicatorStyle = IndicatorStyle::left;
+    } else if (wcscmp(runningIndicatorStyle, L"leftIconWidth") == 0) {
+        g_settings.runningIndicatorStyle = IndicatorStyle::leftIconWidth;
+    } else if (wcscmp(runningIndicatorStyle, L"leftFocusedIconWidth") == 0) {
+        g_settings.runningIndicatorStyle = IndicatorStyle::leftFocusedIconWidth;
+    } else if (wcscmp(runningIndicatorStyle, L"focusedFullWidth") == 0) {
+        g_settings.runningIndicatorStyle = IndicatorStyle::focusedFullWidth;
     } else if (wcscmp(runningIndicatorStyle, L"fullWidth") == 0) {
         g_settings.runningIndicatorStyle = IndicatorStyle::fullWidth;
     }
@@ -1800,6 +1825,8 @@ void LoadSettings() {
     g_settings.progressIndicatorStyle = g_settings.runningIndicatorStyle;
     if (wcscmp(progressIndicatorStyle, L"centerDynamic") == 0) {
         g_settings.progressIndicatorStyle = IndicatorStyle::centerDynamic;
+    } else if (wcscmp(progressIndicatorStyle, L"leftIconWidth") == 0) {
+        g_settings.progressIndicatorStyle = IndicatorStyle::leftIconWidth;
     } else if (wcscmp(progressIndicatorStyle, L"fullWidth") == 0) {
         g_settings.progressIndicatorStyle = IndicatorStyle::fullWidth;
     }
